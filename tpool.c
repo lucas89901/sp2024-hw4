@@ -46,7 +46,29 @@ void PrintList(struct List* list) {
 
 // === thread ===
 
+// Cleanup handlers ensure mutexes are unlocked after a thread is cancelled, so
+// that other threads can get the mutex needed to recover from
+// `pthread_cond_wait()`.
+//
+// According to the specification,
+// > It is guaranteed that there will be at least one `tpool_synchronize` call,
+// > and there will be no `tpool_request` between the last `tpool_synchronize`
+// > and `tpool_destroy`.
+// so both frontend and backend threads are assumed to be blocked by
+// `pthread_cond_wait()` and therefore holding a mutex when `tpool_destroy()` is
+// called.
+//
+// clang-format off
+// Reference: https://man7.org/linux/man-pages/man3/pthread_cond_init.3.html#CANCELLATION
+// clang-format on
+
+void FrontendCleanup(void* arg) {
+  struct tpool* tpool = (struct tpool*)arg;
+  pthread_mutex_unlock(&tpool->requests_mutex);
+}
+
 void* HandleRequest(void* arg) {
+  pthread_cleanup_push(FrontendCleanup, arg);
   struct tpool* tpool = (struct tpool*)arg;
   while (1) {
     // Try to pop request from `tpool->requests`.
@@ -111,10 +133,17 @@ void* HandleRequest(void* arg) {
     pthread_cond_signal(&tpool->done);
     pthread_mutex_unlock(&tpool->running_mutex);
   }
+  pthread_cleanup_pop(0);
   return NULL;
 }
 
+void BackendCleanup(void* arg) {
+  struct tpool* tpool = (struct tpool*)arg;
+  pthread_mutex_unlock(&tpool->works_mutex);
+}
+
 void* DoWork(void* arg) {
+  pthread_cleanup_push(BackendCleanup, arg);
   struct tpool* tpool = (struct tpool*)arg;
   while (1) {
     // Try to pop work from `tpool->works`.
@@ -144,6 +173,7 @@ void* DoWork(void* arg) {
     pthread_mutex_unlock(&tpool->running_mutex);
     // LOG("DoWork: Done work %p", (void*)work);
   }
+  pthread_cleanup_pop(0);
   return NULL;
 }
 
@@ -209,29 +239,18 @@ void tpool_synchronize(struct tpool* pool) {
 }
 
 void tpool_destroy(struct tpool* pool) {
-  // Ensure that a cancelled thread can get the mutex needed to recover from
-  // `pthread_cond_wait()`.
-  // clang-format off
-  // Reference: https://man7.org/linux/man-pages/man3/pthread_cond_init.3.html#CANCELLATION
-  // clang-format on
-  pthread_mutex_unlock(&pool->requests_mutex);
   pthread_cancel(pool->frontend);
   LOG("tpool_destroy: Frontend cancelled");
   for (int i = 0; i < pool->backend_count; ++i) {
-    pthread_mutex_unlock(&pool->works_mutex);
     pthread_cancel(pool->backends[i]);
     LOG("tpool_destroy(): Backend %d cancalled", i);
   }
   free(pool->backends);
 
-  // Ensure mutexes are unlocked before destruction.
-  pthread_mutex_unlock(&pool->running_mutex);
   pthread_mutex_destroy(&pool->running_mutex);
   pthread_cond_destroy(&pool->done);
-  pthread_mutex_unlock(&pool->requests_mutex);
   pthread_mutex_destroy(&pool->requests_mutex);
   pthread_cond_destroy(&pool->requests_nonempty);
-  pthread_mutex_unlock(&pool->works_mutex);
   pthread_mutex_destroy(&pool->works_mutex);
   pthread_cond_destroy(&pool->works_nonempty);
 
