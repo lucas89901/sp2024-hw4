@@ -61,6 +61,10 @@ void* HandleRequest(void* arg) {
     pthread_mutex_unlock(&tpool->requests_mutex);
     LOG("HandleRequest: Popped request=%p", (void*)request);
 
+    pthread_mutex_lock(&tpool->running_mutex);
+    ++tpool->running_count;
+    pthread_mutex_unlock(&tpool->running_mutex);
+
     // Tranpose `b`.
     Matrix bT = malloc(tpool->n * sizeof(Vector));
     for (int i = 0; i < tpool->n; ++i) {
@@ -101,6 +105,11 @@ void* HandleRequest(void* arg) {
     pthread_cond_signal(&tpool->works_nonempty);
     pthread_mutex_unlock(&tpool->works_mutex);
     free(request);
+
+    pthread_mutex_lock(&tpool->running_mutex);
+    --tpool->running_count;
+    pthread_cond_signal(&tpool->done);
+    pthread_mutex_unlock(&tpool->running_mutex);
   }
   return NULL;
 }
@@ -116,6 +125,11 @@ void* DoWork(void* arg) {
     struct Work* work = ListPop(&tpool->works);
     pthread_mutex_unlock(&tpool->works_mutex);
 
+    pthread_mutex_lock(&tpool->running_mutex);
+    ++tpool->running_count;
+    pthread_mutex_unlock(&tpool->running_mutex);
+    LOG("DoWork: Doing work %p", (void*)work);
+
     for (int i = work->start; i < work->end; ++i) {
       int row = i / tpool->n;
       int column = i % tpool->n;
@@ -123,6 +137,12 @@ void* DoWork(void* arg) {
           calculation(tpool->n, work->a[row], work->b[column]);
     }
     free(work);
+
+    pthread_mutex_lock(&tpool->running_mutex);
+    --tpool->running_count;
+    pthread_cond_signal(&tpool->done);
+    pthread_mutex_unlock(&tpool->running_mutex);
+    // LOG("DoWork: Done work %p", (void*)work);
   }
   return NULL;
 }
@@ -132,6 +152,10 @@ void* DoWork(void* arg) {
 struct tpool* tpool_init(int num_threads, int n) {
   struct tpool* tpool = malloc(sizeof(struct tpool));
   tpool->n = n;
+  tpool->backend_count = num_threads;
+  tpool->backends = malloc(num_threads * sizeof(pthread_t));
+  tpool->running_count = 0;
+
   tpool->requests.size = 0;
   tpool->requests.head = NULL;
   tpool->requests.tail = NULL;
@@ -139,6 +163,8 @@ struct tpool* tpool_init(int num_threads, int n) {
   tpool->works.head = NULL;
   tpool->works.tail = NULL;
 
+  pthread_mutex_init(&tpool->running_mutex, NULL);
+  pthread_cond_init(&tpool->done, NULL);
   pthread_mutex_init(&tpool->requests_mutex, NULL);
   pthread_cond_init(&tpool->requests_nonempty, NULL);
   pthread_mutex_init(&tpool->works_mutex, NULL);
@@ -148,8 +174,7 @@ struct tpool* tpool_init(int num_threads, int n) {
   pthread_create(&tpool->frontend, NULL, HandleRequest, tpool);
   // Backend threads.
   for (int i = 0; i < num_threads; ++i) {
-    pthread_t thread;
-    pthread_create(&thread, NULL, DoWork, tpool);
+    pthread_create(&tpool->backends[i], NULL, DoWork, tpool);
   }
   return tpool;
 }
@@ -171,11 +196,44 @@ void tpool_request(struct tpool* pool, Matrix a, Matrix b, Matrix c,
 }
 
 void tpool_synchronize(struct tpool* pool) {
-  // TODO: Properly sync threads.
-  sleep(2);
+  pthread_mutex_lock(&pool->running_mutex);
+  // There are still threads doing stuff.
+  while (pool->requests.size > 0 || pool->works.size > 0 ||
+         pool->running_count > 0) {
+    LOG("tpool_synchronize: Waiting..., requets.size=%d, works.size=%d, "
+        "running_count=%d",
+        pool->requests.size, pool->works.size, pool->running_count);
+    pthread_cond_wait(&pool->done, &pool->running_mutex);
+  }
+  pthread_mutex_unlock(&pool->running_mutex);
 }
 
 void tpool_destroy(struct tpool* pool) {
-  // TODO: Ensure no memory leaks.
+  // Ensure that a cancelled thread can get the mutex needed to recover from
+  // `pthread_cond_wait()`.
+  // clang-format off
+  // Reference: https://man7.org/linux/man-pages/man3/pthread_cond_init.3.html#CANCELLATION
+  // clang-format on
+  pthread_mutex_unlock(&pool->requests_mutex);
+  pthread_cancel(pool->frontend);
+  LOG("tpool_destroy: Frontend cancelled");
+  for (int i = 0; i < pool->backend_count; ++i) {
+    pthread_mutex_unlock(&pool->works_mutex);
+    pthread_cancel(pool->backends[i]);
+    LOG("tpool_destroy(): Backend %d cancalled", i);
+  }
+  free(pool->backends);
+
+  // Ensure mutexes are unlocked before destruction.
+  pthread_mutex_unlock(&pool->running_mutex);
+  pthread_mutex_destroy(&pool->running_mutex);
+  pthread_cond_destroy(&pool->done);
+  pthread_mutex_unlock(&pool->requests_mutex);
+  pthread_mutex_destroy(&pool->requests_mutex);
+  pthread_cond_destroy(&pool->requests_nonempty);
+  pthread_mutex_unlock(&pool->works_mutex);
+  pthread_mutex_destroy(&pool->works_mutex);
+  pthread_cond_destroy(&pool->works_nonempty);
+
   free(pool);
 }

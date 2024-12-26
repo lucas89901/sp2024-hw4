@@ -48,7 +48,14 @@ struct List {
 
 struct tpool {
   int n;  // Size of matrices.
+
   pthread_t frontend;
+  int backend_count;
+  pthread_t* backends;
+
+  int running_count;
+  pthread_mutex_t running_mutex;
+  pthread_cond_t done;
 
   struct List requests;
   pthread_mutex_t requests_mutex;
