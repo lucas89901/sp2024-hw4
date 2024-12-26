@@ -58,12 +58,12 @@ void* HandleRequest(void* arg) {
     LOG("&tpool->requests=...");
     PrintList(&tpool->requests);
     struct Request* request = ListPop(&tpool->requests);
-    pthread_mutex_unlock(&tpool->requests_mutex);
-    LOG("HandleRequest: Popped request=%p", (void*)request);
 
     pthread_mutex_lock(&tpool->running_mutex);
     ++tpool->running_count;
     pthread_mutex_unlock(&tpool->running_mutex);
+    pthread_mutex_unlock(&tpool->requests_mutex);
+    LOG("HandleRequest: Popped request=%p", (void*)request);
 
     // Tranpose `b`.
     Matrix bT = malloc(tpool->n * sizeof(Vector));
@@ -123,11 +123,11 @@ void* DoWork(void* arg) {
       pthread_cond_wait(&tpool->works_nonempty, &tpool->works_mutex);
     }
     struct Work* work = ListPop(&tpool->works);
-    pthread_mutex_unlock(&tpool->works_mutex);
 
     pthread_mutex_lock(&tpool->running_mutex);
     ++tpool->running_count;
     pthread_mutex_unlock(&tpool->running_mutex);
+    pthread_mutex_unlock(&tpool->works_mutex);
     LOG("DoWork: Doing work %p", (void*)work);
 
     for (int i = work->start; i < work->end; ++i) {
