@@ -12,7 +12,7 @@
   fprintf(stderr, __VA_ARGS__);                                               \
   fprintf(stderr, "\n")
 #else
-#define CHECK(...) __VA_ARGS__
+#define CHECK(...)
 #define LOG(...)
 #endif
 
